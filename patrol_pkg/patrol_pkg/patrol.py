@@ -1,184 +1,162 @@
 import cv2
 import mediapipe as mp
+import time
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
-import math
+from sensor_msgs.msg import LaserScan
+from rclpy.qos import ReliabilityPolicy, QoSProfile
 
-class HandDetectionNode(Node):
+class HandGestureAndLidar(Node):
     def __init__(self):
-        super().__init__('hand_detection_node')
-
-        # ROS2 Publisher for robot movement
-        self.cmd_vel_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
-
-        # Mediapipe Hand Detection
+        super().__init__('hand_gesture_lidar')
+        
+        # ROS2 publishers and subscribers
+        self.publisher_ = self.create_publisher(Twist, 'cmd_vel', 10)
+        self.subscriber = self.create_subscription(
+            LaserScan, 
+            '/scan', 
+            self.laser_callback, 
+            QoSProfile(depth=10, reliability=ReliabilityPolicy.SYSTEM_DEFAULT)
+        )
+        
+        self.laser_forward = 0
+        self.laser_left = float('inf')
+        self.laser_right = float('inf')
+        self.safe_distance = 0.5
+        self.cmd = Twist()
+        
         self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(static_image_mode=False, max_num_hands=1, min_detection_confidence=0.5)
-        self.mp_drawing = mp.solutions.drawing_utils  # Import the drawing utils
-
-        # Camera Setup
-        self.window_name = "cam1"
-        cv2.namedWindow(self.window_name)
+        self.hands = self.mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        self.mp_draw = mp.solutions.drawing_utils
+        
+        # Replace camera setup with turtlebot camera stream
         self.cap = cv2.VideoCapture("http://10.2.172.103:8080/?action=stream")
-
         if not self.cap.isOpened():
-            self.get_logger().error("Failed to open camera stream.")
-            return
+            self.get_logger().error("Could not open turtlebot camera stream")
+            raise RuntimeError("Camera stream not accessible")
+        
+        # Control variables
+        self.gesture_state = "STOP"
+        self.timer = self.create_timer(0.1, self.control_loop)
 
-        self.timer = self.create_timer(0.1, self.process_frame)
+    def laser_callback(self, msg):
+        self.laser_forward = msg.ranges[0] 
+        self.laser_left = min([r for r in msg.ranges[0:45] if r != float('inf')], default=float('inf'))
+        self.laser_right = min([r for r in msg.ranges[-45:] if r != float('inf')], default=float('inf'))
 
-    def process_frame(self):
-        ret, frame = self.cap.read()
-        if not ret:
-            self.get_logger().error("Failed to read frame from camera.")
-            return
+    def recognize_gesture(self, hand_landmarks):
+        if not hand_landmarks:
+            return "UNKNOWN"
 
-        # Rescale frame
-        frame = self.rescale_frame(frame, 75)
+        # Get landmark positions
+        landmarks = hand_landmarks.landmark
+        
+        thumb_tip = landmarks[4]
+        index_tip = landmarks[8]
+        middle_tip = landmarks[12]
+        middle_mcp = landmarks[9]
+        
+        # Detect OK sign (thumb and index finger form a circle)
+        thumb_index_distance = ((thumb_tip.x - index_tip.x)**2 + 
+                              (thumb_tip.y - index_tip.y)**2)**0.5
+        if thumb_index_distance < 0.1:
+            return "TURN_RIGHT"
+        
+        elif (middle_tip.y < landmarks[8].y and 
+            middle_tip.y < landmarks[16].y and 
+            middle_tip.y < landmarks[20].y):
+            return "STOP"
+        
+        elif thumb_tip.y < middle_mcp.y:
+            return "FORWARD"
+        
+        elif thumb_tip.y > middle_tip.y:
+            return "BACKWARD"
+        
+        return "UNKNOWN"
 
-        # Convert frame to RGB
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        # Detect hands
-        result = self.hands.process(rgb_frame)
-
-        if result.multi_hand_landmarks:
-            for hand_landmarks in result.multi_hand_landmarks:
-                # Check if all five fingers are open, or perform specific gestures
-                if self.is_all_fingers_open(hand_landmarks):
-                    self.get_logger().info("All fingers open! Moving forward.")
-                    self.move_forward()
-                elif self.is_index_finger_shown(hand_landmarks):
-                    self.get_logger().info("Index finger shown! Moving backward.")
-                    self.move_backward()
-                elif self.is_index_and_middle_finger_shown(hand_landmarks):
-                    self.get_logger().info("Index + middle finger shown! Turning around.")
-                    self.turn_around()
-                else:
-                    self.get_logger().info("Hand is closed! Stopping robot.")
-                    self.stop_robot()
-
-                # Draw hand landmarks
-                self.mp_drawing.draw_landmarks(frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
-
-        # Display the frame
-        cv2.imshow(self.window_name, frame)
-        if cv2.waitKey(1) & 0xFF == 27:
-            self.destroy()
-
-    def is_all_fingers_open(self, hand_landmarks):
-        # Check if all five fingers are open by checking the distances from tips to bases
-        open_threshold = 0.05  # You can adjust this threshold value
-
-        # Thumb (landmark 4, base 2)
-        thumb_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.THUMB_TIP]
-        thumb_base = hand_landmarks.landmark[self.mp_hands.HandLandmark.THUMB_MCP]
-
-        # Index finger (landmark 8, base 5)
-        index_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.INDEX_FINGER_TIP]
-        index_base = hand_landmarks.landmark[self.mp_hands.HandLandmark.INDEX_FINGER_MCP]
-
-        # Middle finger (landmark 12, base 9)
-        middle_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
-        middle_base = hand_landmarks.landmark[self.mp_hands.HandLandmark.MIDDLE_FINGER_MCP]
-
-        # Ring finger (landmark 16, base 13)
-        ring_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.RING_FINGER_TIP]
-        ring_base = hand_landmarks.landmark[self.mp_hands.HandLandmark.RING_FINGER_MCP]
-
-        # Pinky (landmark 20, base 17)
-        pinky_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.PINKY_TIP]
-        pinky_base = hand_landmarks.landmark[self.mp_hands.HandLandmark.PINKY_MCP]
-
-        # Calculate distances between tip and base of each finger
-        thumb_distance = self.calculate_distance(thumb_tip, thumb_base)
-        index_distance = self.calculate_distance(index_tip, index_base)
-        middle_distance = self.calculate_distance(middle_tip, middle_base)
-        ring_distance = self.calculate_distance(ring_tip, ring_base)
-        pinky_distance = self.calculate_distance(pinky_tip, pinky_base)
-
-        # If all distances are greater than the threshold, the hand is fully open
-        if (thumb_distance > open_threshold and
-            index_distance > open_threshold and
-            middle_distance > open_threshold and
-            ring_distance > open_threshold and
-            pinky_distance > open_threshold):
-            return True
-        else:
-            return False
-
-    def is_index_finger_shown(self, hand_landmarks):
-        # Get the position of the index finger tip (landmark 8)
-        index_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.INDEX_FINGER_TIP]
-
-        # We check if the index finger is extended by comparing its position to the base of the hand
-        index_base = hand_landmarks.landmark[self.mp_hands.HandLandmark.INDEX_FINGER_MCP]
-        distance = self.calculate_distance(index_tip, index_base)
-
-        # If the index finger is extended (distance > threshold), return True
-        return distance > 0.05  # Adjust this threshold as needed
-
-    def is_index_and_middle_finger_shown(self, hand_landmarks):
-        # Get the positions of the index and middle finger tips (landmarks 8 and 12)
-        index_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.INDEX_FINGER_TIP]
-        middle_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
-
-        # Calculate the distance between the index and middle finger tips
-        distance = self.calculate_distance(index_tip, middle_tip)
-
-        # If the index and middle fingers are both extended (distance > threshold), return True
-        return distance > 0.05  # Adjust this threshold as needed
-
-    def calculate_distance(self, point1, point2):
-        # Calculate the Euclidean distance between two points (x, y, z)
-        return math.sqrt((point2.x - point1.x) ** 2 + (point2.y - point1.y) ** 2 + (point2.z - point1.z) ** 2)
-
-    def move_forward(self):
-        twist = Twist()
-        twist.linear.x = 0.1  # Move forward slowly
-        twist.angular.z = 0.0
-        self.cmd_vel_publisher.publish(twist)
-
-    def move_backward(self):
-        twist = Twist()
-        twist.linear.x = -0.1  # Move backward slowly
-        twist.angular.z = 0.0
-        self.cmd_vel_publisher.publish(twist)
-
-    def turn_around(self):
-        twist = Twist()
-        twist.linear.x = 0.0
-        twist.angular.z = 0.5  # Turn around slowly
-        self.cmd_vel_publisher.publish(twist)
-
-    def stop_robot(self):
-        twist = Twist()
-        twist.linear.x = 0.0
-        twist.angular.z = 0.0
-        self.cmd_vel_publisher.publish(twist)
-
-    def rescale_frame(self, frame, percent):
-        width = int(frame.shape[1] * percent / 100)
-        height = int(frame.shape[0] * percent / 100)
+    def rescale_frame(self, frame, percent=75):
+        width = int(frame.shape[1] * percent/ 100)
+        height = int(frame.shape[0] * percent/ 100)
         dim = (width, height)
         return cv2.resize(frame, dim, interpolation=cv2.INTER_AREA)
 
-    def destroy(self):
-        self.cap.release()
-        cv2.destroyAllWindows()
-        rclpy.shutdown()
+    def control_loop(self):
+        success, img = self.cap.read()
+        if not success:
+            return
+        
+        img = self.rescale_frame(img, 75)
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        results = self.hands.process(img_rgb)
+        
+        if results.multi_hand_landmarks:
+            for hand_landmarks in results.multi_hand_landmarks:
+                self.mp_draw.draw_landmarks(
+                    img, 
+                    hand_landmarks, 
+                    self.mp_hands.HAND_CONNECTIONS
+                )
+                self.gesture_state = self.recognize_gesture(hand_landmarks)
+        
+        # Display gesture state
+        cv2.putText(img, f"Gesture: {self.gesture_state}", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        
+        # Control logic with fixed speeds
+        if self.gesture_state == "STOP":
+            self.cmd.linear.x = 0.0
+            self.cmd.angular.z = 0.0
+            self.get_logger().info('STOP command sent')
+        elif self.gesture_state == "FORWARD":
+            if self.laser_forward < self.safe_distance:
+                if self.laser_left > self.laser_right:
+                    self.cmd.linear.x = 0.0
+                    self.cmd.angular.z = 0.2
+                    self.get_logger().info('Turning left due to obstacle')
+                else:
+                    self.cmd.linear.x = 0.0
+                    self.cmd.angular.z = -0.2
+                    self.get_logger().info('Turning right due to obstacle')
+            else:
+                self.cmd.linear.x = 0.2  # Fixed forward speed
+                self.cmd.angular.z = 0.0
+                self.get_logger().info('Moving forward')
+        elif self.gesture_state == "BACKWARD":
+            self.cmd.linear.x = -0.2  # Fixed backward speed
+            self.cmd.angular.z = 0.0
+            self.get_logger().info('Moving backward')
+        elif self.gesture_state == "TURN_RIGHT":
+            self.cmd.linear.x = 0.0
+            self.cmd.angular.z = -0.2  # Fixed turning speed
+            self.get_logger().info('Turning right')
 
+        # Publish command
+        self.publisher_.publish(self.cmd)
+        
+        # Show camera feed
+        cv2.imshow("Hand Gesture Control", img)
+        cv2.waitKey(1)
 
 def main(args=None):
     rclpy.init(args=args)
-    hand_detection_node = HandDetectionNode()
-
+    controller = HandGestureAndLidar()
+    
     try:
-        rclpy.spin(hand_detection_node)
+        rclpy.spin(controller)
     except KeyboardInterrupt:
-        hand_detection_node.get_logger().info("Shutting down hand detection node.")
-        hand_detection_node.destroy()
+        pass
+    finally:
+        controller.cap.release()
+        cv2.destroyAllWindows()
+        controller.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
